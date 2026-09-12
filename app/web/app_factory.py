@@ -4,6 +4,7 @@ from flask import Flask
 from app.config import Config
 from app.web.routes_health import health_bp
 from app.web.routes_auth import auth_bp
+from app.web.routes_watches import watches_bp
 
 
 def create_app(config: Config, session_factory, scheduler=None, slack_client=None) -> Flask:
@@ -26,4 +27,5 @@ def create_app(config: Config, session_factory, scheduler=None, slack_client=Non
 
     app.register_blueprint(health_bp)
     app.register_blueprint(auth_bp)
+    app.register_blueprint(watches_bp)
     return app
