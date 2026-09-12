@@ -1,0 +1,13 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>{{ watch.feed_url }}</h1>
+<ul>
+  <li>Channel: {{ watch.slack_channel_id }}</li>
+  <li>Template: {{ watch.template.value }}</li>
+  <li>Active: {{ watch.is_active }}</li>
+  <li>Last checked: {{ watch.last_checked_at }}</li>
+  <li>Last posted: {{ watch.last_posted_at }}</li>
+  <li>Consecutive failures: {{ watch.consecutive_failure_count }}</li>
+  <li>Last error: {{ watch.last_error }}</li>
+</ul>
+{% endblock %}

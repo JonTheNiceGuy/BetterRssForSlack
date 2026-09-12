@@ -1,0 +1,29 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>API Tokens</h1>
+{% if minted_plaintext %}
+<div class="flash">New token (shown once): <code>{{ minted_plaintext }}</code></div>
+{% endif %}
+<form method="post" action="/tokens/mint">
+  <label>Description <input type="text" name="description"></label>
+  <label>TTL seconds <input type="number" name="ttl_seconds" value="3600"></label>
+  <button type="submit">Mint token</button>
+</form>
+<table>
+  <tr><th>Description</th><th>Expires</th><th>Revoked</th><th></th></tr>
+  {% for token in tokens %}
+  <tr>
+    <td>{{ token.description or "" }}</td>
+    <td>{{ token.expires_at }}</td>
+    <td>{{ "yes" if token.revoked_at else "no" }}</td>
+    <td>
+      {% if not token.revoked_at %}
+      <form method="post" action="/tokens/{{ token.id }}/revoke">
+        <button type="submit">Revoke</button>
+      </form>
+      {% endif %}
+    </td>
+  </tr>
+  {% endfor %}
+</table>
+{% endblock %}

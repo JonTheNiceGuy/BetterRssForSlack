@@ -1,0 +1,33 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>New Watch</h1>
+<form method="post">
+  <p><label>Feed URL <input type="url" name="feed_url" required></label></p>
+  <p><label>Channel
+    <select name="slack_channel_id" required>
+      {% for channel in channels %}
+      <option value="{{ channel.id }}">{{ channel.name }}</option>
+      {% endfor %}
+    </select>
+  </label></p>
+  <p><label>Template
+    <select name="template">
+      <option value="headline_link">Headline and link only</option>
+      <option value="headline_link_truncated">Headline, link and truncated body</option>
+      <option value="headline_link_thread">Headline, link and threaded reply</option>
+      <option value="headline_link_full">Headline, link and full body</option>
+    </select>
+  </label></p>
+  <p><label>Visibility
+    <select name="visibility">
+      <option value="owner_only">Only me (+ admins)</option>
+      <option value="group">My group</option>
+      <option value="public">Anyone authenticated</option>
+    </select>
+  </label></p>
+  <p><label>Owning group (if visibility=group) <input type="text" name="owning_group"></label></p>
+  <p><label>Check interval (seconds) <input type="number" name="check_interval_seconds" value="3600" required></label></p>
+  <p><label>Auto-pause after N consecutive failures (0=never) <input type="number" name="auto_pause_after_failures" value="0"></label></p>
+  <p><button type="submit">Create</button></p>
+</form>
+{% endblock %}

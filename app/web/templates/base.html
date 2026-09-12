@@ -1,0 +1,32 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>{% block title %}BetterRssForSlack{% endblock %}</title>
+  <style>
+    body { font-family: sans-serif; margin: 2rem; }
+    nav { margin-bottom: 1.5rem; }
+    table { border-collapse: collapse; width: 100%; }
+    th, td { border: 1px solid #ccc; padding: 0.4rem 0.6rem; text-align: left; }
+    .flash { background: #fffae6; border: 1px solid #e0c96b; padding: 0.5rem; margin-bottom: 1rem; }
+  </style>
+</head>
+<body>
+  <nav>
+    {% if identity %}
+      {{ identity.sub }}{% if identity.is_admin %} (admin){% endif %}
+      &middot; <a href="/">Dashboard</a>
+      &middot; <a href="/tokens">Tokens</a>
+      &middot; <a href="/logout">Logout</a>
+    {% else %}
+      <a href="/login">Login</a>
+    {% endif %}
+  </nav>
+  {% with messages = get_flashed_messages() %}
+    {% for message in messages %}
+      <div class="flash">{{ message }}</div>
+    {% endfor %}
+  {% endwith %}
+  {% block content %}{% endblock %}
+</body>
+</html>

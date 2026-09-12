@@ -1,0 +1,24 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>RSS Watches</h1>
+<p><a href="/watches/new">+ New watch</a></p>
+<table>
+  <tr><th>Feed</th><th>Channel</th><th>Template</th><th>Active</th><th>Actions</th></tr>
+  {% for watch in watches %}
+  <tr>
+    <td><a href="/watches/{{ watch.id }}">{{ watch.feed_url }}</a></td>
+    <td>{{ watch.slack_channel_id }}</td>
+    <td>{{ watch.template.value }}</td>
+    <td>{{ "yes" if watch.is_active else "no" }}</td>
+    <td>
+      <form style="display:inline" method="post" action="/watches/{{ watch.id }}/{{ 'resume' if not watch.is_active else 'pause' }}">
+        <button type="submit">{{ "Resume" if not watch.is_active else "Pause" }}</button>
+      </form>
+      <form style="display:inline" method="post" action="/watches/{{ watch.id }}/delete">
+        <button type="submit">Delete</button>
+      </form>
+    </td>
+  </tr>
+  {% endfor %}
+</table>
+{% endblock %}
