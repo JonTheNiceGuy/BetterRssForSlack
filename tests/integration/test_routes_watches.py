@@ -153,3 +153,31 @@ def test_pause_and_resume(db_engine, postgres_container, monkeypatch):
     resp = client.post(f"/api/v1/watches/{watch_id}/resume")
     assert resp.status_code == 200
     assert rec.resumed == [watch_id]
+
+
+class FakeSlackClient:
+    def conversations_list(self, **kwargs):
+        return {"channels": [{"id": "C1", "name": "general"}]}
+
+
+def test_slack_channels_list_requires_login(db_engine, postgres_container):
+    app = create_app(
+        make_test_config(postgres_container.get_connection_url()),
+        make_session_factory(db_engine), scheduler=object(), slack_client=FakeSlackClient(),
+    )
+    app.secret_key = "test-secret"
+    resp = app.test_client().get("/api/v1/slack-channels")
+    assert resp.status_code == 401
+
+
+def test_slack_channels_list_returns_channels(db_engine, postgres_container):
+    app = create_app(
+        make_test_config(postgres_container.get_connection_url()),
+        make_session_factory(db_engine), scheduler=object(), slack_client=FakeSlackClient(),
+    )
+    app.secret_key = "test-secret"
+    client = app.test_client()
+    login_as(client, "u1")
+    resp = client.get("/api/v1/slack-channels")
+    assert resp.status_code == 200
+    assert resp.get_json() == [{"id": "C1", "name": "general"}]

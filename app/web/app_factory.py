@@ -4,7 +4,8 @@ from flask import Flask
 from app.config import Config
 from app.web.routes_health import health_bp
 from app.web.routes_auth import auth_bp
-from app.web.routes_watches import watches_bp
+from app.web.routes_watches import watches_bp, slack_channels_view
+from app.web.routes_tokens import tokens_bp
 
 
 def create_app(config: Config, session_factory, scheduler=None, slack_client=None) -> Flask:
@@ -28,4 +29,6 @@ def create_app(config: Config, session_factory, scheduler=None, slack_client=Non
     app.register_blueprint(health_bp)
     app.register_blueprint(auth_bp)
     app.register_blueprint(watches_bp)
+    app.register_blueprint(tokens_bp)
+    app.add_url_rule("/api/v1/slack-channels", view_func=slack_channels_view)
     return app

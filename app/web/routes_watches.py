@@ -7,6 +7,7 @@ from app.identity_resolver import identity_from_session
 from app.models.rss_watch import RssWatch
 from app.models.enums import Template, Visibility
 from app.worker.scheduler import sync_job, pause_job, resume_job, remove_job
+from app.slack.channel_cache import list_bot_channels
 
 watches_bp = Blueprint("watches", __name__, url_prefix="/api/v1/watches")
 
@@ -177,3 +178,11 @@ def resume(watch_id):
         return jsonify(_serialize(watch)), 200
     finally:
         db_session.close()
+
+
+def slack_channels_view():
+    identity = _current_identity()
+    if identity is None:
+        return jsonify({"error": "unauthorized"}), 401
+    slack_client = current_app.extensions["slack_client"]
+    return jsonify(list_bot_channels(slack_client)), 200
