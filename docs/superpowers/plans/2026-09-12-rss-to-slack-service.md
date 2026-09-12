@@ -15,9 +15,11 @@ split into small dependency-free modules so it can be unit-tested without a
 DB or network; anything touching Postgres is tested against a real container
 via `testcontainers-python`.
 
-**Tech Stack:** Python 3.14, Flask, Authlib (OIDC), SQLAlchemy 2.x, Alembic,
-APScheduler 3.x (`SQLAlchemyJobStore`), feedparser, slack_sdk, html2text,
-python-json-logger, pytest + testcontainers-python, Docker/docker-compose.
+**Tech Stack:** Python 3.14, Flask + Jinja2 (basic server-rendered UI),
+Authlib (OIDC), SQLAlchemy 2.x, Alembic, APScheduler 3.x
+(`SQLAlchemyJobStore`), feedparser, slack_sdk, html2text,
+python-json-logger, pytest + testcontainers-python, Playwright (live e2e
+OIDC login test against tinyoidc), Docker/docker-compose.
 
 **Spec:** `docs/superpowers/specs/2026-09-12-rss-to-slack-design.md`
 
@@ -174,6 +176,7 @@ dev = [
     "pytest-cov>=6.0",
     "testcontainers[postgres]>=4.9",
     "responses>=0.25",
+    "playwright>=1.49",
 ]
 
 [tool.pytest.ini_options]
@@ -2501,15 +2504,15 @@ git add app/web/routes_auth.py app/web/app_factory.py tests/integration/test_rou
 git commit -m "feat: add OIDC login/callback/logout routes"
 ```
 
-**Manual follow-up (not automated by this plan):** once Task 16 adds real
-watch routes, do one live, human-driven login against
-`https://tinyoidc.authenti-kate.org` in a browser to confirm the discovery
-document, the `groups` claim's actual shape, and the redirect URI
-allowlist all match what this task assumes — tinyoidc's exact login-form
-HTML isn't known at plan-writing time, so it can't be scripted into pytest
-here. If the `groups` claim doesn't exist on tinyoidc, treat every login as
-`groups=[]` and rely on `ADMIN_OIDC_GROUPS`/manual DB edits for admin access
-in the POC, and note the gap back in the spec.
+**Confirmed live (plan-writing time):** tinyoidc's discovery document at
+`https://tinyoidc.authenti-kate.org/.well-known/openid-configuration` lists
+`authorization_endpoint=.../c2s/authorize`, `token_endpoint=.../s2s/token`,
+`userinfo_endpoint=.../s2s/userinfo`, and genuinely supports the `groups`
+scope/claim. Its authorize page has no password form — one "Login as
+&lt;user&gt;" button per pre-seeded account (admin/it/accounts/auditor/
+sysadmin/reception/contractor), each with real `groups` claims (`admin`'s
+groups include `admins`, matching `ADMIN_OIDC_GROUPS` by design). Task 22
+drives this login live with Playwright.
 
 ---
 
@@ -3583,19 +3586,638 @@ git commit -m "feat: add docker-compose for local dev with migrate-before-app li
 
 ---
 
+## Task 21: Basic HTML UI
+
+**Files:**
+- Create: `app/web/templates/base.html`
+- Create: `app/web/templates/dashboard.html`
+- Create: `app/web/templates/watch_form.html`
+- Create: `app/web/templates/watch_detail.html`
+- Create: `app/web/templates/tokens.html`
+- Create: `app/web/routes_ui.py`
+- Modify: `app/web/app_factory.py` (register `ui_bp`)
+- Test: `tests/integration/test_routes_ui.py`
+
+**Interfaces:**
+- Consumes: `app.acl.can_access`, `app.identity_resolver.identity_from_session`
+  (Task 4/13), `app.models.rss_watch.RssWatch`,
+  `app.models.enums.{Template, Visibility}` (Task 2),
+  `app.worker.scheduler.{sync_job, pause_job, resume_job, remove_job}`
+  (Task 12), `app.slack.channel_cache.list_bot_channels` (Task 10),
+  `app.tokens.service.{mint_token, revoke_token}` (Task 5),
+  `app.web.routes_watches._current_identity` (Task 16, reused as-is).
+- Produces: a `ui_bp` blueprint (no URL prefix — root-level, distinct from
+  `watches_bp`/`tokens_bp`'s `/api/v1/...` JSON prefix, so no path
+  collision): `GET /` (dashboard), `GET,POST /watches/new`,
+  `GET /watches/<id>`, `POST /watches/<id>/delete`,
+  `POST /watches/<id>/pause`, `POST /watches/<id>/resume`, `GET /tokens`,
+  `POST /tokens/mint`, `POST /tokens/<id>/revoke`. This is a thin view
+  layer — it duplicates the small amount of ORM logic already exercised in
+  Tasks 16/17's JSON routes rather than factoring a shared service module,
+  since each duplicated block is a few lines and premature sharing would
+  couple two independently-evolving response formats (JSON vs redirect+
+  flash) before there's a second UI consumer to justify it.
+
+- [ ] **Step 1: Write the failing test**
+
+```python
+# tests/integration/test_routes_ui.py
+import datetime as dt
+from app.config import Config
+from app.web.app_factory import create_app
+from app.db import make_session_factory
+from app.models.slack_channel_cache import SlackChannelCache
+
+class FakeSlackClient:
+    def conversations_list(self, **kwargs):
+        return {"channels": [{"id": "C1", "name": "general"}]}
+
+def make_test_config(db_url):
+    return Config(
+        database_url=db_url,
+        oidc_issuer="https://tinyoidc.authenti-kate.org",
+        oidc_client_id="client_id_12decaf34bad56",
+        oidc_client_secret="Super-+Secret_=Key0123456789",
+        slack_bot_token="xoxb-fake",
+        admin_oidc_groups=frozenset({"admins"}),
+    )
+
+def build_app(db_engine, postgres_container):
+    config = make_test_config(postgres_container.get_connection_url())
+    app = create_app(
+        config, make_session_factory(db_engine), scheduler=object(), slack_client=FakeSlackClient()
+    )
+    app.secret_key = "test-secret"
+    return app
+
+def login_as(client, sub, groups=None):
+    with client.session_transaction() as sess:
+        sess["sub"] = sub
+        sess["groups"] = groups or []
+
+def seed_channel(db_engine):
+    session = make_session_factory(db_engine)()
+    session.add(SlackChannelCache(id="C1", name="general", last_refreshed_at=dt.datetime.now(dt.timezone.utc)))
+    session.commit()
+    session.close()
+
+def test_dashboard_requires_login_redirects_to_login(db_engine, postgres_container):
+    app = build_app(db_engine, postgres_container)
+    resp = app.test_client().get("/", follow_redirects=False)
+    assert resp.status_code == 302
+    assert resp.headers["Location"].endswith("/login")
+
+def test_new_watch_form_shows_channel_picker_options(db_engine, postgres_container):
+    seed_channel(db_engine)
+    app = build_app(db_engine, postgres_container)
+    client = app.test_client()
+    login_as(client, "u1")
+    resp = client.get("/watches/new")
+    assert resp.status_code == 200
+    assert b"general" in resp.data
+
+def test_create_watch_via_form_then_see_it_on_dashboard(db_engine, postgres_container):
+    seed_channel(db_engine)
+    app = build_app(db_engine, postgres_container)
+    client = app.test_client()
+    login_as(client, "u1")
+    resp = client.post("/watches/new", data={
+        "feed_url": "https://example.com/feed.xml",
+        "slack_channel_id": "C1",
+        "template": "headline_link",
+        "visibility": "owner_only",
+        "check_interval_seconds": "3600",
+        "auto_pause_after_failures": "0",
+    }, follow_redirects=False)
+    assert resp.status_code == 302
+
+    resp = client.get("/")
+    assert b"https://example.com/feed.xml" in resp.data
+
+def test_admin_badge_shown_for_admin_group_member(db_engine, postgres_container):
+    app = build_app(db_engine, postgres_container)
+    client = app.test_client()
+    login_as(client, "u1", groups=["admins"])
+    resp = client.get("/")
+    assert b"(admin)" in resp.data
+
+def test_mint_token_via_form_shows_plaintext_once(db_engine, postgres_container):
+    app = build_app(db_engine, postgres_container)
+    client = app.test_client()
+    login_as(client, "u1")
+    resp = client.post("/tokens/mint", data={"ttl_seconds": "3600", "description": "cli"}, follow_redirects=True)
+    assert resp.status_code == 200
+    assert b"cli" in resp.data
+```
+
+- [ ] **Step 2: Run test to verify it fails**
+
+Run: `pytest tests/integration/test_routes_ui.py -v`
+Expected: FAIL with `ModuleNotFoundError: No module named 'app.web.routes_ui'`
+
+- [ ] **Step 3: Write `app/web/templates/base.html`**
+
+```html
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>{% block title %}BetterRssForSlack{% endblock %}</title>
+  <style>
+    body { font-family: sans-serif; margin: 2rem; }
+    nav { margin-bottom: 1.5rem; }
+    table { border-collapse: collapse; width: 100%; }
+    th, td { border: 1px solid #ccc; padding: 0.4rem 0.6rem; text-align: left; }
+    .flash { background: #fffae6; border: 1px solid #e0c96b; padding: 0.5rem; margin-bottom: 1rem; }
+  </style>
+</head>
+<body>
+  <nav>
+    {% if identity %}
+      {{ identity.sub }}{% if identity.is_admin %} (admin){% endif %}
+      &middot; <a href="/">Dashboard</a>
+      &middot; <a href="/tokens">Tokens</a>
+      &middot; <a href="/logout">Logout</a>
+    {% else %}
+      <a href="/login">Login</a>
+    {% endif %}
+  </nav>
+  {% with messages = get_flashed_messages() %}
+    {% for message in messages %}
+      <div class="flash">{{ message }}</div>
+    {% endfor %}
+  {% endwith %}
+  {% block content %}{% endblock %}
+</body>
+</html>
+```
+
+- [ ] **Step 4: Write `app/web/templates/dashboard.html`**
+
+```html
+{% extends "base.html" %}
+{% block content %}
+<h1>RSS Watches</h1>
+<p><a href="/watches/new">+ New watch</a></p>
+<table>
+  <tr><th>Feed</th><th>Channel</th><th>Template</th><th>Active</th><th>Actions</th></tr>
+  {% for watch in watches %}
+  <tr>
+    <td><a href="/watches/{{ watch.id }}">{{ watch.feed_url }}</a></td>
+    <td>{{ watch.slack_channel_id }}</td>
+    <td>{{ watch.template.value }}</td>
+    <td>{{ "yes" if watch.is_active else "no" }}</td>
+    <td>
+      <form style="display:inline" method="post" action="/watches/{{ watch.id }}/{{ 'resume' if not watch.is_active else 'pause' }}">
+        <button type="submit">{{ "Resume" if not watch.is_active else "Pause" }}</button>
+      </form>
+      <form style="display:inline" method="post" action="/watches/{{ watch.id }}/delete">
+        <button type="submit">Delete</button>
+      </form>
+    </td>
+  </tr>
+  {% endfor %}
+</table>
+{% endblock %}
+```
+
+- [ ] **Step 5: Write `app/web/templates/watch_form.html`**
+
+```html
+{% extends "base.html" %}
+{% block content %}
+<h1>New Watch</h1>
+<form method="post">
+  <p><label>Feed URL <input type="url" name="feed_url" required></label></p>
+  <p><label>Channel
+    <select name="slack_channel_id" required>
+      {% for channel in channels %}
+      <option value="{{ channel.id }}">{{ channel.name }}</option>
+      {% endfor %}
+    </select>
+  </label></p>
+  <p><label>Template
+    <select name="template">
+      <option value="headline_link">Headline and link only</option>
+      <option value="headline_link_truncated">Headline, link and truncated body</option>
+      <option value="headline_link_thread">Headline, link and threaded reply</option>
+      <option value="headline_link_full">Headline, link and full body</option>
+    </select>
+  </label></p>
+  <p><label>Visibility
+    <select name="visibility">
+      <option value="owner_only">Only me (+ admins)</option>
+      <option value="group">My group</option>
+      <option value="public">Anyone authenticated</option>
+    </select>
+  </label></p>
+  <p><label>Owning group (if visibility=group) <input type="text" name="owning_group"></label></p>
+  <p><label>Check interval (seconds) <input type="number" name="check_interval_seconds" value="3600" required></label></p>
+  <p><label>Auto-pause after N consecutive failures (0=never) <input type="number" name="auto_pause_after_failures" value="0"></label></p>
+  <p><button type="submit">Create</button></p>
+</form>
+{% endblock %}
+```
+
+- [ ] **Step 6: Write `app/web/templates/watch_detail.html`**
+
+```html
+{% extends "base.html" %}
+{% block content %}
+<h1>{{ watch.feed_url }}</h1>
+<ul>
+  <li>Channel: {{ watch.slack_channel_id }}</li>
+  <li>Template: {{ watch.template.value }}</li>
+  <li>Active: {{ watch.is_active }}</li>
+  <li>Last checked: {{ watch.last_checked_at }}</li>
+  <li>Last posted: {{ watch.last_posted_at }}</li>
+  <li>Consecutive failures: {{ watch.consecutive_failure_count }}</li>
+  <li>Last error: {{ watch.last_error }}</li>
+</ul>
+{% endblock %}
+```
+
+- [ ] **Step 7: Write `app/web/templates/tokens.html`**
+
+```html
+{% extends "base.html" %}
+{% block content %}
+<h1>API Tokens</h1>
+{% if minted_plaintext %}
+<div class="flash">New token (shown once): <code>{{ minted_plaintext }}</code></div>
+{% endif %}
+<form method="post" action="/tokens/mint">
+  <label>Description <input type="text" name="description"></label>
+  <label>TTL seconds <input type="number" name="ttl_seconds" value="3600"></label>
+  <button type="submit">Mint token</button>
+</form>
+<table>
+  <tr><th>Description</th><th>Expires</th><th>Revoked</th><th></th></tr>
+  {% for token in tokens %}
+  <tr>
+    <td>{{ token.description or "" }}</td>
+    <td>{{ token.expires_at }}</td>
+    <td>{{ "yes" if token.revoked_at else "no" }}</td>
+    <td>
+      {% if not token.revoked_at %}
+      <form method="post" action="/tokens/{{ token.id }}/revoke">
+        <button type="submit">Revoke</button>
+      </form>
+      {% endif %}
+    </td>
+  </tr>
+  {% endfor %}
+</table>
+{% endblock %}
+```
+
+- [ ] **Step 8: Write `app/web/routes_ui.py`**
+
+```python
+# app/web/routes_ui.py
+import datetime as dt
+from flask import Blueprint, current_app, flash, redirect, render_template, request, session
+
+from app.acl import can_access
+from app.web.routes_watches import _current_identity
+from app.models.rss_watch import RssWatch
+from app.models.enums import Template, Visibility
+from app.models.api_token import ApiToken
+from app.worker.scheduler import sync_job, pause_job, resume_job, remove_job
+from app.slack.channel_cache import list_bot_channels
+from app.tokens.service import mint_token, revoke_token
+
+ui_bp = Blueprint("ui", __name__)
+
+@ui_bp.route("/")
+def dashboard():
+    identity = _current_identity()
+    if identity is None:
+        return redirect("/login")
+    db_session = current_app.extensions["session_factory"]()
+    try:
+        all_watches = db_session.query(RssWatch).all()
+        visible = [w for w in all_watches if can_access(w, identity)]
+        return render_template("dashboard.html", watches=visible, identity=identity)
+    finally:
+        db_session.close()
+
+@ui_bp.route("/watches/new", methods=["GET", "POST"])
+def new_watch():
+    identity = _current_identity()
+    if identity is None:
+        return redirect("/login")
+    slack_client = current_app.extensions["slack_client"]
+
+    if request.method == "GET":
+        channels = list_bot_channels(slack_client)
+        return render_template("watch_form.html", channels=channels, identity=identity)
+
+    db_session = current_app.extensions["session_factory"]()
+    try:
+        watch = RssWatch(
+            feed_url=request.form["feed_url"],
+            slack_channel_id=request.form["slack_channel_id"],
+            template=Template(request.form["template"]),
+            visibility=Visibility(request.form.get("visibility", "owner_only")),
+            owning_group=request.form.get("owning_group") or None,
+            created_by_sub=identity.sub,
+            created_at=dt.datetime.now(dt.timezone.utc),
+            check_interval_seconds=int(request.form["check_interval_seconds"]),
+            auto_pause_after_failures=int(request.form.get("auto_pause_after_failures", 0)),
+        )
+        db_session.add(watch)
+        db_session.commit()
+        sync_job(current_app.extensions["scheduler"], watch)
+        flash("Watch created.")
+        return redirect("/")
+    finally:
+        db_session.close()
+
+def _load_visible_watch(db_session, identity, watch_id):
+    watch = db_session.get(RssWatch, watch_id)
+    if watch is None or not can_access(watch, identity):
+        return None
+    return watch
+
+@ui_bp.route("/watches/<int:watch_id>")
+def watch_detail(watch_id):
+    identity = _current_identity()
+    if identity is None:
+        return redirect("/login")
+    db_session = current_app.extensions["session_factory"]()
+    try:
+        watch = _load_visible_watch(db_session, identity, watch_id)
+        if watch is None:
+            return "Not found", 404
+        return render_template("watch_detail.html", watch=watch, identity=identity)
+    finally:
+        db_session.close()
+
+@ui_bp.route("/watches/<int:watch_id>/delete", methods=["POST"])
+def delete_watch(watch_id):
+    identity = _current_identity()
+    if identity is None:
+        return redirect("/login")
+    db_session = current_app.extensions["session_factory"]()
+    try:
+        watch = _load_visible_watch(db_session, identity, watch_id)
+        if watch is None:
+            return "Not found", 404
+        db_session.delete(watch)
+        db_session.commit()
+        remove_job(current_app.extensions["scheduler"], watch_id)
+        flash("Watch deleted.")
+        return redirect("/")
+    finally:
+        db_session.close()
+
+@ui_bp.route("/watches/<int:watch_id>/pause", methods=["POST"])
+def pause_watch(watch_id):
+    identity = _current_identity()
+    if identity is None:
+        return redirect("/login")
+    db_session = current_app.extensions["session_factory"]()
+    try:
+        watch = _load_visible_watch(db_session, identity, watch_id)
+        if watch is None:
+            return "Not found", 404
+        watch.is_active = False
+        db_session.commit()
+        pause_job(current_app.extensions["scheduler"], watch_id)
+        return redirect("/")
+    finally:
+        db_session.close()
+
+@ui_bp.route("/watches/<int:watch_id>/resume", methods=["POST"])
+def resume_watch(watch_id):
+    identity = _current_identity()
+    if identity is None:
+        return redirect("/login")
+    db_session = current_app.extensions["session_factory"]()
+    try:
+        watch = _load_visible_watch(db_session, identity, watch_id)
+        if watch is None:
+            return "Not found", 404
+        watch.is_active = True
+        watch.consecutive_failure_count = 0
+        db_session.commit()
+        resume_job(current_app.extensions["scheduler"], watch_id)
+        return redirect("/")
+    finally:
+        db_session.close()
+
+@ui_bp.route("/tokens", methods=["GET"])
+def tokens_page():
+    identity = _current_identity()
+    if identity is None:
+        return redirect("/login")
+    db_session = current_app.extensions["session_factory"]()
+    try:
+        rows = db_session.query(ApiToken).filter(ApiToken.owner_sub == identity.sub).all()
+        return render_template("tokens.html", tokens=rows, identity=identity, minted_plaintext=None)
+    finally:
+        db_session.close()
+
+@ui_bp.route("/tokens/mint", methods=["POST"])
+def tokens_mint():
+    identity = _current_identity()
+    if identity is None:
+        return redirect("/login")
+    config = current_app.extensions["config"]
+    ttl_seconds = min(int(request.form.get("ttl_seconds", config.token_max_ttl_seconds)), config.token_max_ttl_seconds)
+    db_session = current_app.extensions["session_factory"]()
+    try:
+        _, raw = mint_token(
+            db_session, identity.sub, ttl_seconds=ttl_seconds,
+            description=request.form.get("description") or None,
+        )
+        db_session.commit()
+        rows = db_session.query(ApiToken).filter(ApiToken.owner_sub == identity.sub).all()
+        return render_template("tokens.html", tokens=rows, identity=identity, minted_plaintext=raw)
+    finally:
+        db_session.close()
+
+@ui_bp.route("/tokens/<int:token_id>/revoke", methods=["POST"])
+def tokens_revoke(token_id):
+    identity = _current_identity()
+    if identity is None:
+        return redirect("/login")
+    db_session = current_app.extensions["session_factory"]()
+    try:
+        row = db_session.get(ApiToken, token_id)
+        if row is None or row.owner_sub != identity.sub:
+            return "Not found", 404
+        revoke_token(db_session, token_id)
+        db_session.commit()
+        return redirect("/tokens")
+    finally:
+        db_session.close()
+```
+
+- [ ] **Step 9: Register `ui_bp` and add a secret key needed for `flash()` sessions in `app_factory.py`**
+
+```python
+# app/web/app_factory.py — add import and one registration line
+from app.web.routes_ui import ui_bp
+# ... inside create_app, after the other register_blueprint calls:
+    app.register_blueprint(ui_bp)
+```
+
+- [ ] **Step 10: Run tests to verify they pass**
+
+Run: `pytest tests/integration/test_routes_ui.py -v`
+Expected: PASS (5 tests)
+
+- [ ] **Step 11: Commit**
+
+```bash
+git add app/web/templates app/web/routes_ui.py app/web/app_factory.py tests/integration/test_routes_ui.py
+git commit -m "feat: add basic server-rendered HTML UI for watches and tokens"
+```
+
+---
+
+## Task 22: Playwright end-to-end OIDC login test
+
+**Files:**
+- Create: `tests/e2e/__init__.py` (empty)
+- Create: `tests/e2e/conftest.py`
+- Create: `tests/e2e/test_oidc_login.py`
+
+**Interfaces:**
+- Consumes: `app.web.app_factory.create_app` (Task 17/21), `app.config.Config`
+  (Task 1), `app.db.{make_engine, make_session_factory}` (Task 2), real
+  network access to `https://tinyoidc.authenti-kate.org`.
+- Produces: a `live_app` pytest fixture that runs the real Flask app on a
+  real TCP port via `werkzeug.serving.make_server` in a background thread
+  (a browser needs an actual socket — `app.test_client()` cannot be driven
+  by Playwright), yielding the base URL, torn down after the test.
+
+This test requires internet access and depends on a third-party service
+being up — keep it in its own `tests/e2e/` directory so it can be run
+separately from the fast, hermetic suite (`pytest tests/unit
+tests/integration` for the fast path; `pytest tests/e2e` for this one).
+
+- [ ] **Step 1: Install Playwright's browser binary (one-time, not a test step)**
+
+Run: `playwright install --with-deps chromium`
+Expected: downloads and installs headless Chromium; only needs to run once
+per environment (or once per Docker image layer if this test runs in CI
+later).
+
+- [ ] **Step 2: Write `tests/e2e/conftest.py`**
+
+```python
+# tests/e2e/conftest.py
+import threading
+import pytest
+from werkzeug.serving import make_server
+
+from app.config import Config
+from app.db import make_session_factory
+from app.web.app_factory import create_app
+
+LIVE_PORT = 8765
+
+@pytest.fixture()
+def live_app(db_engine, postgres_container):
+    config = Config(
+        database_url=postgres_container.get_connection_url(),
+        oidc_issuer="https://tinyoidc.authenti-kate.org",
+        oidc_client_id="client_id_12decaf34bad56",
+        oidc_client_secret="Super-+Secret_=Key0123456789",
+        slack_bot_token="xoxb-fake",
+        admin_oidc_groups=frozenset({"admins"}),
+    )
+    app = create_app(config, make_session_factory(db_engine), scheduler=object(), slack_client=object())
+    app.secret_key = "e2e-secret"
+
+    server = make_server("127.0.0.1", LIVE_PORT, app)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield f"http://127.0.0.1:{LIVE_PORT}"
+    finally:
+        server.shutdown()
+        thread.join()
+```
+
+- [ ] **Step 3: Write the failing test**
+
+```python
+# tests/e2e/test_oidc_login.py
+from playwright.sync_api import sync_playwright
+
+def test_login_as_admin_reaches_dashboard_with_admin_badge(live_app):
+    with sync_playwright() as p:
+        browser = p.chromium.launch()
+        page = browser.new_page()
+        try:
+            page.goto(f"{live_app}/login")
+            page.get_by_role("button", name="Login as admin").click()
+            page.wait_for_url(f"{live_app}/**")
+
+            assert "(admin)" in page.content()
+        finally:
+            browser.close()
+```
+
+- [ ] **Step 4: Run test to verify it fails**
+
+Run: `pytest tests/e2e/test_oidc_login.py -v`
+Expected: FAIL — either a redirect-URI rejection from tinyoidc (surfaces as
+a Playwright navigation/timeout error, not a hang, since
+`wait_for_url`/`click` have finite default timeouts) or, if the redirect
+works, a failure because `session["groups"]` isn't populated with the
+`groups` claim yet (Task 15's `callback` route already reads
+`userinfo.get("groups", [])`, so this should already work — if it doesn't,
+that is the actual bug this test exists to catch).
+
+- [ ] **Step 5: Fix whatever the failure reveals**
+
+Two likely fixes, applied only if the test actually surfaces them (do not
+apply speculatively):
+- If tinyoidc rejects the callback's redirect_uri: register/confirm the
+  correct allowed redirect URI pattern with tinyoidc (check `/app` on the
+  tinyoidc site, mentioned on its homepage as where test credentials/app
+  registration happens) and adjust `LIVE_PORT`/the callback URL to match,
+  rather than guessing further.
+- If `groups` arrives in a different shape than a plain list (e.g.
+  comma-joined string, matching the "admins,Users,service_admins" format
+  seen on the account-picker page rather than a JSON array): adjust
+  `app/web/routes_auth.py`'s `callback()` to split on `,` when
+  `userinfo["groups"]` is a string before storing it in the session — this
+  is a real production code fix, not test-only scaffolding, since real
+  logins hit the same shape.
+
+- [ ] **Step 6: Run test to verify it passes**
+
+Run: `pytest tests/e2e/test_oidc_login.py -v`
+Expected: PASS
+
+- [ ] **Step 7: Commit**
+
+```bash
+git add tests/e2e app/web/routes_auth.py
+git commit -m "test: add Playwright end-to-end OIDC login test against tinyoidc"
+```
+
+(Only include `app/web/routes_auth.py` in the commit if Step 5 actually
+changed it.)
+
+---
+
 ## Self-Review Notes
 
 - **Spec coverage:** every spec section has a task — architecture (Task 1
   file structure + Tasks 18-20), data model (Task 2/3), auth & ACL (Tasks
-  4/13/15), web routes (Tasks 16/17), worker behavior incl. backfill and
-  auto-pause (Tasks 7/11), Slack integration incl. rate limiting (Tasks
-  9/10), logging (Task 14), testing approach (used throughout, real
-  Postgres via testcontainers), deployment (Tasks 19/20), config (Task 1).
-  Not covered by an automated task: the live tinyoidc login round-trip
-  (flagged as a manual follow-up in Task 15, since its exact login-form
-  HTML is unknown at plan-writing time) and any HTML templates for the web
-  UI (the plan implements the JSON API the spec calls for; templates are a
-  follow-on, not blocked by anything here).
+  4/13/15), web routes incl. the HTML UI (Tasks 16/17/21), worker behavior
+  incl. backfill and auto-pause (Tasks 7/11), Slack integration incl. rate
+  limiting (Tasks 9/10), logging (Task 14), testing approach (used
+  throughout, real Postgres via testcontainers, plus a genuine live login
+  round-trip against tinyoidc in Task 22), deployment (Tasks 19/20), config
+  (Task 1). Nothing in the spec is left without a task.
 - **Type/name consistency check:** `Identity`, `can_access`, `Template`,
   `Visibility`, `FeedEntry`, `find_new_entries`, `render`,
   `ThrottledSlackClient.post_message`, `check_watch`, `sync_job`/

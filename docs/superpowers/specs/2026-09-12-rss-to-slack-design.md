@@ -99,8 +99,9 @@ and report uniformly (no separate broader "view" rule):
 
 ## Web app routes
 
-UI routes and a mirrored `/api/v1/...` JSON surface, both passing through the
-same `can_access` check and identity resolver:
+Two parallel surfaces, both passing through the same `can_access` check and
+identity resolver, both backed by the same models/services — a basic
+server-rendered Jinja2 HTML UI for humans, and a JSON API for scripts/tokens:
 
 - `/login`, `/auth/callback`, `/logout`
 - `/` — dashboard, watches visible to current identity
@@ -116,6 +117,17 @@ same `can_access` check and identity resolver:
 - `/tokens/mint` — `POST {ttl_seconds?, description?}`, `ttl_seconds` capped
   by `TOKEN_MAX_TTL_SECONDS`; returns plaintext token once
 - `/tokens/<id>/revoke`
+
+**HTML UI:** basic, unstyled-beyond-minimal Jinja2 templates — a base layout
+with a nav bar (current user's email + an "(admin)" badge when
+`is_admin`, Logout link), a dashboard listing visible watches with
+pause/resume/delete actions, a create/edit form (channel picker populated
+from the bot's live channel list, template/visibility/interval/
+auto-pause/backfill fields), a watch detail page showing the report fields,
+and a tokens page (mint form + list + revoke, plaintext token shown once
+directly in the rendered page after minting). This is a thin view layer over
+the same watch/token operations the JSON API uses — no client-side
+framework, plain HTML forms posting back to the app.
 
 ## Worker behavior
 
@@ -188,9 +200,22 @@ Red/Green TDD throughout. `pytest` + `pytest-cov`. DB-touching tests run
 against a real Postgres via `testcontainers-python` (no SQLite dialect
 drift — this project targets Postgres only, in test and prod alike).
 Template-render functions and the diff/cursor logic are pure and unit-tested
-without a DB. Slack calls mocked in web/worker tests. One thin integration
-test exercises a real login round-trip against
-`tinyoidc.authenti-kate.org`, since it's a standing POC IdP built for this.
+without a DB. Slack calls mocked in web/worker tests.
+
+One genuine end-to-end test drives a real login round-trip against
+`tinyoidc.authenti-kate.org` with Playwright (headless Chromium): the app
+runs as a real HTTP server (not the Flask test client, since a browser needs
+a real socket), Playwright opens `/login`, lands on tinyoidc's real
+account-picker page (confirmed live: no password form — one "Login as
+&lt;user&gt;" button per pre-seeded account: admin/it/accounts/auditor/
+sysadmin/reception/contractor), clicks "Login as admin" (pre-seeded groups
+`admins,Users,service_admins` — `admin` lands in our own `ADMIN_OIDC_GROUPS`
+by design), and the test asserts the app's dashboard renders the logged-in
+user's email and the "(admin)" badge. This is a real network dependency on
+a standing third-party POC service — acceptable here since tinyoidc exists
+specifically to be driven this way — and proves the discovery document,
+the `groups` claim, and the redirect_uri round-trip all actually work
+end-to-end, not just against mocks.
 
 ## Deployment
 
