@@ -1,3 +1,4 @@
+import os
 from logging.config import fileConfig
 
 from alembic import context
@@ -9,6 +10,14 @@ import app.models  # noqa: F401 - registers tables on Base.metadata
 config = context.config
 if config.config_file_name is not None:
     fileConfig(config.config_file_name)
+
+# alembic.ini's sqlalchemy.url is a placeholder for local `alembic` CLI use
+# (e.g. the migrate container) -- DATABASE_URL takes precedence when set.
+# Callers like the test suite that call set_main_option() directly still
+# take priority over this, since they set it after config load but before
+# run_migrations_online/offline execute here.
+if os.environ.get("DATABASE_URL"):
+    config.set_main_option("sqlalchemy.url", os.environ["DATABASE_URL"])
 
 target_metadata = Base.metadata
 
